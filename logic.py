@@ -1,8 +1,11 @@
 import hashlib
 import os
+import json
 import numpy as np
 from dotenv import load_dotenv
-from openai import OpenAI
+#from openai import OpenAI
+from sentence_transformers import SentenceTransformer
+from typing import List, Optional
 
 from chat.models import PromptRequest, PromptResponse
 from cache.redis_backend import RedisCache
@@ -10,13 +13,15 @@ from cache.config import CacheConfig
 
 # Load environment variables
 load_dotenv()
+local_embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
-# OpenAI client (v1.0+)
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# OpenAI client
+#client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 cache = RedisCache()
 
 USE_SEMANTIC_CACHE = getattr(CacheConfig, "USE_SEMANTIC_CACHE", False)
-SIMILARITY_THRESHOLD = getattr(CacheConfig, "SIMILARITY_THRESHOLD", 0.9)
+#SIMILARITY_THRESHOLD = getattr(CacheConfig, "SIMILARITY_THRESHOLD", 0.9)
 
 
 def generate_key(session_id: str, message: str) -> str:
@@ -26,13 +31,10 @@ def generate_key(session_id: str, message: str) -> str:
 
 def embed_text(text: str) -> np.ndarray:
     try:
-        response = client.embeddings.create(
-            model="text-embedding-ada-002",
-            input=[text]
-        )
-        return np.array(response.data[0].embedding)
+        embedding = local_embedder.encode([text])[0]
+        return np.array(embedding)
     except Exception as e:
-        print(f"[Embedding Error] {e}")
+        print(f"[Local Embedding Error] {e}")
         return None
 
 
@@ -59,47 +61,149 @@ def bot_logic(message: str) -> str:
         return f"(error generating response: {e})"
 
 
-def find_semantic_match(session_id: str, input_embedding: np.ndarray):
-    matches = []
-    for key in cache.list_keys():
-        if key.startswith(f"chat:{session_id}:") and key.endswith(":vec"):
-            vec_data = cache.get(key)
-            response_key = key.replace(":vec", ":response")
-            response_text = cache.get(response_key)
-            if vec_data and response_text:
-                vec = np.array(vec_data)
-                score = cosine_similarity(input_embedding, vec)
-                if score >= SIMILARITY_THRESHOLD:
-                    matches.append((score, response_text))
-    if matches:
-        matches.sort(reverse=True)
-        return matches[0][1]
+
+def find_semantic_match(session_id: str, query_embedding: List[float]) -> Optional[str]:
+    # Scan for versioned vector keys
+    pattern = f"chat:v1:{session_id}:*:vec"
+    keys = list(cache.scan_iter(match=pattern))
+    best_key = None
+    best_score = -1.0
+
+    for key in keys:
+        # Normalize key to string
+        key_str = key.decode() if isinstance(key, bytes) else str(key)
+        # Retrieve the stored embedding
+        embedding = cache.get(key_str)
+        if not embedding:
+            continue
+
+        try:
+            # Convert embedding to numpy array
+            stored_vec = np.array(embedding, dtype=np.float32)
+            score = cosine_similarity(query_embedding, stored_vec)
+            print(f"[Debug] Compared with {key_str} → Score: {score:.4f}")
+            if score > best_score:
+                best_score = score
+                best_key = key_str
+        except Exception as e:
+            print(f"Error comparing embeddings for {key_str}: {e}")
+            continue
+
+    if best_score >= CacheConfig.SIMILARITY_THRESHOLD:
+        print(f"[Semantic Match] Key: {best_key}, Score: {best_score:.4f}")
+        return best_key
+
+    print(f"[Semantic Miss] Best score: {best_score:.4f} (Threshold: {CacheConfig.SIMILARITY_THRESHOLD})")
     return None
 
+def classify_prompt(prompt: str) -> str:
+    prompt = prompt.lower()
+
+    # AI / Machine Learning
+    if any(term in prompt for term in ["transformer", "bert", "gpt", "llm", "attention mechanism"]):
+        return "AI.NLP.TransformerModels"
+    if any(term in prompt for term in ["classification", "regression", "supervised", "unsupervised"]):
+        return "AI.ML.ModelTypes"
+    if "embedding" in prompt or "vector search" in prompt:
+        return "AI.NLP.SemanticSearch"
+
+    # Finance
+    if any(term in prompt for term in ["revenue", "recognition", "accrual", "invoice"]):
+        return "Finance.Accounting.RevenueRecognition"
+    if any(term in prompt for term in ["credit score", "risk", "loan"]):
+        return "Finance.Risk.CreditScoring"
+    if "tax" in prompt or "filing" in prompt:
+        return "Finance.Tax.Compliance"
+
+    # Medicine / Healthcare
+    if any(term in prompt for term in ["diagnosis", "symptom", "treatment"]):
+        return "Medicine.General.Diagnosis"
+    if "oncology" in prompt or "cancer" in prompt:
+        return "Medicine.Oncology.TreatmentPlan"
+    if any(term in prompt for term in ["insurance", "authorization", "payer"]):
+        return "Medicine.Admin.PriorAuth"
+
+    # Tech / Databases
+    if any(term in prompt for term in ["sql", "join", "query", "select", "index"]):
+        return "Tech.Databases.SQL"
+    if any(term in prompt for term in ["nosql", "redis", "cache", "memory store"]):
+        return "Tech.Systems.Caching"
+    if any(term in prompt for term in ["api", "endpoint", "rest", "postman"]):
+        return "Tech.Backend.API"
+
+    # General / Fallback
+    return "General.Uncategorized"
 
 def process_prompt(req: PromptRequest) -> PromptResponse:
-    # Semantic match first (if enabled)
+    message = req.message or req.prompt
+    embedding = None
+
     if USE_SEMANTIC_CACHE:
-        embedding = embed_text(req.message)
+        embedding = embed_text(message)
         if embedding is not None:
             match = find_semantic_match(req.session_id, embedding)
             if match:
-                return PromptResponse(session_id=req.session_id, response=match, from_cache=True)
+                full_entry = cache.get(match.replace(":vec", ""))
+                if isinstance(full_entry, dict):
+                    response = full_entry.get("response") or ""
+                    label = full_entry.get("label") or ""
+                else:
+                    # fallback if structure hasn't been updated yet
+                    response = full_entry or ""
+                    label = None
 
-    # Fallback to exact match
-    key = generate_key(req.session_id, req.message)
+                stored_vec = np.array(cache.get(match), dtype=np.float32)
+                score = float(cosine_similarity(embedding, stored_vec))
+                print(f"[CACHE HIT] Semantic match: {match}, Score: {score:.4f}")
+                return PromptResponse(
+                    session_id=req.session_id,
+                    response=response,
+                    from_cache=True,
+                    similarity=score,
+                    label=label
+                )
+
+    # exact-match fallback
+    key = generate_key(req.session_id, message)
     cached = cache.get(key)
     if cached:
-        return PromptResponse(session_id=req.session_id, response=cached, from_cache=True)
+        print(f"[CACHE HIT] Exact match: {key}")
+        if isinstance(cached, dict):
+            return PromptResponse(
+                session_id=req.session_id,
+                response=cached.get("response") or "",
+                from_cache=True,
+                similarity=None,
+                label=cached.get("label") or ""
+            )
+        else:
+            return PromptResponse(
+                session_id=req.session_id,
+                response=cached or "",
+                from_cache=True,
+                similarity=None
+            )
 
-    # Generate fresh response
-    response = bot_logic(req.message)
-    cache.set(key, response)
+    # generate fresh
+    response = f"Answer to: {message}" 
+    label = classify_prompt(message)
+
+    redis_payload = {
+        "prompt": message,
+        "response": response,
+        "label": label
+    }
+    cache.set(key, redis_payload)
 
     if USE_SEMANTIC_CACHE and embedding is not None:
         vec_key = f"{key}:vec"
-        res_key = f"{key}:response"
-        cache.set(vec_key, embedding.tolist())
-        cache.set(res_key, response)
+        cache.set(vec_key, json.dumps(embedding.tolist()))
 
-    return PromptResponse(session_id=req.session_id, response=response, from_cache=False)
+    print(f"[CACHE MISS] Freshly generated: {message}")
+    return PromptResponse(
+        session_id=req.session_id,
+        response=response,
+        from_cache=False,
+        similarity=None,
+        label=label
+    )
